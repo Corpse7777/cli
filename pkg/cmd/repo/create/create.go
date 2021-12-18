@@ -45,6 +45,10 @@ type CreateOptions struct {
 	DisableIssues     bool
 	DisableWiki       bool
 	Interactive       bool
+
+	ConfirmSubmit bool
+	EnableIssues  bool
+	EnableWiki    bool
 }
 
 func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Command {
@@ -53,9 +57,6 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 		HttpClient: f.HttpClient,
 		Config:     f.Config,
 	}
-
-	var enableIssues bool
-	var enableWiki bool
 
 	cmd := &cobra.Command{
 		Use:   "create [<name>]",
@@ -134,10 +135,10 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 			}
 
 			if cmd.Flags().Changed("enable-issues") {
-				opts.DisableIssues = !enableIssues
+				opts.DisableIssues = !opts.EnableIssues
 			}
 			if cmd.Flags().Changed("enable-wiki") {
-				opts.DisableWiki = !enableWiki
+				opts.DisableWiki = !opts.EnableWiki
 			}
 			if opts.Template != "" && (opts.Homepage != "" || opts.Team != "" || opts.DisableIssues || opts.DisableWiki) {
 				return cmdutil.FlagErrorf("the `--template` option is not supported with `--homepage`, `--team`, `--disable-issues`, or `--disable-wiki`")
@@ -167,9 +168,9 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 	cmd.Flags().BoolVar(&opts.DisableWiki, "disable-wiki", false, "Disable wiki in the new repository")
 
 	// deprecated flags
-	cmd.Flags().BoolP("confirm", "y", false, "Skip the confirmation prompt")
-	cmd.Flags().BoolVar(&enableIssues, "enable-issues", true, "Enable issues in the new repository")
-	cmd.Flags().BoolVar(&enableWiki, "enable-wiki", true, "Enable wiki in the new repository")
+	cmd.Flags().BoolVarP(&opts.ConfirmSubmit, "confirm", "y", false, "Skip the confirmation prompt")
+	cmd.Flags().BoolVar(&opts.EnableIssues, "enable-issues", true, "Enable issues in the new repository")
+	cmd.Flags().BoolVar(&opts.EnableWiki, "enable-wiki", true, "Enable wiki in the new repository")
 
 	_ = cmd.Flags().MarkDeprecated("confirm", "Pass any argument to skip confirmation prompt")
 	_ = cmd.Flags().MarkDeprecated("enable-issues", "Disable issues with `--disable-issues`")
@@ -223,27 +224,31 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 }
 
 func createRun(opts *CreateOptions) error {
-	fromScratch := opts.Source == ""
+	var fromScratch bool
+	modeOptions := []string{
+		"Create a new repository on GitHub from scratch",
+		"Push an existing local repository to GitHub"}
 
 	if opts.Interactive {
-		var selectedMode string
-		modeOptions := []string{
-			"Create a new repository on GitHub from scratch",
-			"Push an existing local repository to GitHub",
-		}
-		if err := prompt.SurveyAskOne(&survey.Select{
+		var createMode string
+		createModePrompt := &survey.Select{
 			Message: "What would you like to do?",
 			Options: modeOptions,
-		}, &selectedMode); err != nil {
+		}
+		err := prompt.SurveyAskOne(createModePrompt, &createMode)
+		if err != nil {
 			return err
 		}
-		fromScratch = selectedMode == modeOptions[0]
+		fromScratch = createMode == modeOptions[0]
+	} else {
+		fromScratch = opts.Source == ""
 	}
 
 	if fromScratch {
 		return createFromScratch(opts)
+	} else {
+		return createFromLocal(opts)
 	}
-	return createFromLocal(opts)
 }
 
 // create new repo on remote host
@@ -275,10 +280,6 @@ func createFromScratch(opts *CreateOptions) error {
 		}
 		opts.LicenseTemplate, err = interactiveLicense(httpClient, host)
 		if err != nil {
-			return err
-		}
-
-		if err := confirmSubmission(opts.Name, opts.Visibility); err != nil {
 			return err
 		}
 	}
@@ -338,6 +339,16 @@ func createFromScratch(opts *CreateOptions) error {
 		return err
 	}
 
+	if opts.Interactive {
+		doCreate, err := confirmSubmission(opts.Name, repoToCreate.RepoOwner(), opts.Visibility)
+		if err != nil {
+			return err
+		}
+		if !doCreate {
+			return cmdutil.CancelError
+		}
+	}
+
 	cs := opts.IO.ColorScheme()
 	isTTY := opts.IO.IsStdoutTTY()
 	if isTTY {
@@ -345,8 +356,6 @@ func createFromScratch(opts *CreateOptions) error {
 			"%s Created repository %s on GitHub\n",
 			cs.SuccessIconWithColor(cs.Green),
 			ghrepo.FullName(repo))
-	} else {
-		fmt.Fprintln(opts.IO.Out, repo.URL)
 	}
 
 	if opts.Interactive {
@@ -494,8 +503,6 @@ func createFromLocal(opts *CreateOptions) error {
 			"%s Created repository %s on GitHub\n",
 			cs.SuccessIconWithColor(cs.Green),
 			ghrepo.FullName(repo))
-	} else {
-		fmt.Fprintln(stdout, repo.URL)
 	}
 
 	protocol, err := cfg.Get(repo.RepoHost(), "git_protocol")
@@ -776,13 +783,13 @@ func interactiveRepoInfo(defaultName string) (string, string, string, error) {
 		{
 			Name: "repoName",
 			Prompt: &survey.Input{
-				Message: "Repository name",
+				Message: "Repository Name: ",
 				Default: defaultName,
 			},
 		},
 		{
 			Name:   "repoDescription",
-			Prompt: &survey.Input{Message: "Description"},
+			Prompt: &survey.Input{Message: "Description: "},
 		},
 		{
 			Name: "repoVisibility",
@@ -809,7 +816,7 @@ func interactiveRepoInfo(defaultName string) (string, string, string, error) {
 func interactiveSource() (string, error) {
 	var sourcePath string
 	sourcePrompt := &survey.Input{
-		Message: "Path to local repository",
+		Message: "Path to local repository: ",
 		Default: "."}
 
 	err := prompt.SurveyAskOne(sourcePrompt, &sourcePath)
@@ -819,28 +826,33 @@ func interactiveSource() (string, error) {
 	return sourcePath, nil
 }
 
-func confirmSubmission(repoWithOwner, visibility string) error {
-	targetRepo := normalizeRepoName(repoWithOwner)
-	if idx := strings.IndexRune(repoWithOwner, '/'); idx > 0 {
-		targetRepo = repoWithOwner[0:idx+1] + normalizeRepoName(repoWithOwner[idx+1:])
+func confirmSubmission(repoName, repoOwner, visibility string) (bool, error) {
+	qs := []*survey.Question{}
+	targetRepo := normalizeRepoName(repoName)
+	if repoOwner != "" {
+		targetRepo = fmt.Sprintf("%s/%s", repoOwner, targetRepo)
 	}
-	var answer struct {
-		ConfirmSubmit bool
-	}
-	err := prompt.SurveyAsk([]*survey.Question{{
+	promptString := fmt.Sprintf(`This will create "%s" as a %s repository on GitHub. Continue?`, targetRepo, strings.ToLower(visibility))
+
+	confirmSubmitQuestion := &survey.Question{
 		Name: "confirmSubmit",
 		Prompt: &survey.Confirm{
-			Message: fmt.Sprintf(`This will create "%s" as a %s repository on GitHub. Continue?`, targetRepo, strings.ToLower(visibility)),
+			Message: promptString,
 			Default: true,
 		},
-	}}, &answer)
+	}
+	qs = append(qs, confirmSubmitQuestion)
+
+	answer := struct {
+		ConfirmSubmit bool
+	}{}
+
+	err := prompt.SurveyAsk(qs, &answer)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if !answer.ConfirmSubmit {
-		return cmdutil.CancelError
-	}
-	return nil
+
+	return answer.ConfirmSubmit, nil
 }
 
 // normalizeRepoName takes in the repo name the user inputted and normalizes it using the same logic as GitHub (GitHub.com/new)
